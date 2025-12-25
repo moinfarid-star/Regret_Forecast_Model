@@ -1,6 +1,8 @@
 import streamlit as st
 import pandas as pd
 import numpy as np
+import math
+from datetime import datetime
 
 from sklearn.model_selection import train_test_split
 from sklearn.preprocessing import OneHotEncoder
@@ -8,6 +10,17 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import r2_score, mean_absolute_error, mean_squared_error
+
+from reportlab.lib.pagesizes import A4
+from reportlab.pdfgen import canvas
+from reportlab.lib.units import cm
+
+
+# =========================
+# CONFIG
+# =========================
+AUTHOR_NAME = "Moin Farid"
+DATA_FILE = "regret_dataset.csv"   # <-- change to regret_dataset_1000.csv if needed
 
 
 # =========================
@@ -19,6 +32,7 @@ st.set_page_config(
     layout="wide",
     initial_sidebar_state="expanded",
 )
+
 
 # =========================
 # Styling (dark/light friendly)
@@ -48,15 +62,20 @@ st.markdown(
       .good { padding: 10px 12px; border-radius: 12px; background: rgba(34,197,94,0.15); border:1px solid rgba(34,197,94,0.35); }
       .warn { padding: 10px 12px; border-radius: 12px; background: rgba(245,158,11,0.15); border:1px solid rgba(245,158,11,0.35); }
       .bad  { padding: 10px 12px; border-radius: 12px; background: rgba(239,68,68,0.14); border:1px solid rgba(239,68,68,0.35); }
+      .pill { display:inline-block; padding: 4px 10px; border-radius: 999px; border: 1px solid rgba(140,140,140,0.35); margin-right: 6px; margin-bottom: 6px; }
       .footer { opacity:0.75; font-size: 12px; margin-top: 18px;}
     </style>
     """,
     unsafe_allow_html=True
 )
 
+
 # =========================
 # Helpers
 # =========================
+def clamp(v, lo, hi):
+    return max(lo, min(hi, v))
+
 def band(score: float) -> str:
     if score < 35:
         return "Low"
@@ -64,9 +83,10 @@ def band(score: float) -> str:
         return "Medium"
     return "High"
 
-def box_class(score: float) -> str:
+def band_style(score: float) -> str:
     b = band(score)
     return "good" if b == "Low" else "warn" if b == "Medium" else "bad"
+
 
 @st.cache_data
 def load_data(path: str) -> pd.DataFrame:
@@ -74,7 +94,10 @@ def load_data(path: str) -> pd.DataFrame:
 
 @st.cache_resource
 def train_pipeline(df: pd.DataFrame):
-    # X & y
+    # features/target
+    if "decision_id" not in df.columns or "regret_index" not in df.columns:
+        raise ValueError("CSV must include decision_id and regret_index columns.")
+
     X = df.drop(columns=["decision_id", "regret_index"])
     y = df["regret_index"]
 
@@ -85,6 +108,11 @@ def train_pipeline(df: pd.DataFrame):
         "numbers_of_options", "time_spent", "uncert_level"
     ]
 
+    # Basic safety checks
+    missing = [c for c in (categorical_cols + numerical_cols) if c not in X.columns]
+    if missing:
+        raise ValueError(f"Missing columns in CSV: {missing}")
+
     X_train, X_test, y_train, y_test = train_test_split(
         X, y, test_size=0.2, random_state=42
     )
@@ -92,33 +120,44 @@ def train_pipeline(df: pd.DataFrame):
     preprocessor = ColumnTransformer(
         transformers=[
             ("cat", OneHotEncoder(handle_unknown="ignore"), categorical_cols),
-            ("num", "passthrough", numerical_cols)
+            ("num", "passthrough", numerical_cols),
         ]
     )
 
     model = RandomForestRegressor(
-        n_estimators=220,
-        max_depth=12,
+        n_estimators=260,
+        max_depth=14,
         random_state=42
     )
 
     pipeline = Pipeline(steps=[
         ("preprocessing", preprocessor),
-        ("model", model)
+        ("model", model),
     ])
 
     pipeline.fit(X_train, y_train)
 
-    # evaluation
-    y_pred = pipeline.predict(X_test)
-    r2 = r2_score(y_test, y_pred)
-    mae = mean_absolute_error(y_test, y_pred)
-    rmse = np.sqrt(mean_squared_error(y_test, y_pred))  # version-safe
+    # evaluation on unseen test data
+    pred_test = pipeline.predict(X_test)
+    r2 = r2_score(y_test, pred_test)
+    mae = mean_absolute_error(y_test, pred_test)
+    rmse = math.sqrt(mean_squared_error(y_test, pred_test))  # version-safe
 
-    return pipeline, {"r2": float(r2), "mae": float(mae), "rmse": float(rmse)}
+    meta = {
+        "pipeline": pipeline,
+        "X_test": X_test,
+        "y_test": y_test,
+        "pred_test": pred_test,
+        "metrics": {"r2": float(r2), "mae": float(mae), "rmse": float(rmse)},
+        "categorical_cols": categorical_cols,
+        "numerical_cols": numerical_cols,
+    }
+    return meta
+
 
 def predict_regret(pipeline, input_df: pd.DataFrame) -> float:
     return float(pipeline.predict(input_df)[0])
+
 
 def what_if(pipeline, base_df: pd.DataFrame, feature: str, new_value):
     modified = base_df.copy()
@@ -127,180 +166,138 @@ def what_if(pipeline, base_df: pd.DataFrame, feature: str, new_value):
     new = predict_regret(pipeline, modified)
     return base, new, (new - base)
 
-def clamp(v, lo, hi):
-    return max(lo, min(hi, v))
+
+def build_insights(input_row: dict):
+    """
+    Quick human insights from inputs (not model explanation).
+    """
+    insights_en = []
+    insights_ur = []
+
+    urgency = input_row["urgency_level"]
+    pressure = input_row["time_pressure"]
+    infoq = input_row["effective_info_quality"]
+    conf = input_row["confidence_level"]
+    uncert = input_row["uncert_level"]
+    options = input_row["numbers_of_options"]
+    t = input_row["time_spent"]
+    cx = input_row["complexity"]
+
+    if urgency >= 8 or pressure >= 8:
+        insights_en.append("High urgency/time pressure can push rushed decisions.")
+        insights_ur.append("Urgency/time pressure zyada ho to decision jaldi mein hota hai, regret barh sakta hai.")
+
+    if infoq <= 4:
+        insights_en.append("Information quality looks low — missing details often create regret later.")
+        insights_ur.append("Info quality low hai — details miss hon to baad mein regret aata hai.")
+
+    if conf <= 4:
+        insights_en.append("Low confidence increases post-decision doubt.")
+        insights_ur.append("Confidence low ho to baad mein doubt aur regret barh jata hai.")
+
+    if uncert >= 7:
+        insights_en.append("High uncertainty is a major driver of regret.")
+        insights_ur.append("Uncertainty zyada ho to regret ka chance bohat barh jata hai.")
+
+    if options >= 10:
+        insights_en.append("Too many options can cause overthinking and choice regret.")
+        insights_ur.append("Options bohat zyada hon to overthinking hoti hai aur regret barhta hai.")
+
+    if t >= 150:
+        insights_en.append("Very high time spent may indicate overthinking.")
+        insights_ur.append("Time bohat zyada spend ho raha hai — overthinking ka signal ho sakta hai.")
+
+    if t <= 25 and cx >= 7:
+        insights_en.append("Too little thinking time for a complex decision can raise regret.")
+        insights_ur.append("Complex decision ke liye time bohat kam hai — regret ka risk barh sakta hai.")
+
+    if not insights_en:
+        insights_en.append("Inputs look balanced. Best lever is usually improving info quality and reducing uncertainty.")
+        insights_ur.append("Inputs balanced lag rahe hain. Best cheez: info improve karo aur uncertainty kam karo.")
+
+    return insights_en, insights_ur
+
+
+def build_pdf_report(payload: dict) -> bytes:
+    """
+    ReportLab PDF generator: returns PDF bytes for st.download_button
+    """
+    from io import BytesIO
+    buf = BytesIO()
+    c = canvas.Canvas(buf, pagesize=A4)
+    w, h = A4
+
+    x = 2.0 * cm
+    y = h - 2.0 * cm
+
+    # Title + Author
+    c.setFont("Helvetica-Bold", 16)
+    c.drawString(x, y, "Regret Forecast Engine — Report")
+    y -= 0.6 * cm
+
+    c.setFont("Helvetica", 10)
+    c.drawString(x, y, f"Generated by: {payload['author']} | {payload['timestamp']}")
+    y -= 0.8 * cm
+
+    # Section helper
+    def section(title):
+        nonlocal y
+        c.setFont("Helvetica-Bold", 12)
+        c.drawString(x, y, title)
+        y -= 0.5 * cm
+        c.setFont("Helvetica", 10)
+
+    def kv(key, val):
+        nonlocal y
+        c.drawString(x, y, f"{key}: {val}")
+        y -= 0.45 * cm
+
+    # Inputs
+    section("Inputs")
+    for k, v in payload["inputs"].items():
+        kv(k, v)
+
+    y -= 0.2 * cm
+
+    # Results
+    section("Results")
+    for k, v in payload["results"].items():
+        kv(k, v)
+
+    y -= 0.2 * cm
+
+    # Model quality
+    section("Model Quality (Unseen Test Data)")
+    for k, v in payload["model_quality"].items():
+        kv(k, v)
+
+    y -= 0.2 * cm
+
+    # Insights
+    section("Insights (English)")
+    for s in payload["insights_en"][:7]:
+        c.drawString(x, y, f"• {s}")
+        y -= 0.45 * cm
+
+    y -= 0.2 * cm
+    section("Insights (Roman Urdu)")
+    for s in payload["insights_ur"][:7]:
+        c.drawString(x, y, f"• {s}")
+        y -= 0.45 * cm
+
+    # Footer
+    y = 1.6 * cm
+    c.setFont("Helvetica-Oblique", 9)
+    c.drawString(x, y, "Disclaimer: This is a decision-support tool, not professional advice.")
+
+    c.showPage()
+    c.save()
+    pdf_bytes = buf.getvalue()
+    buf.close()
+    return pdf_bytes
 
 
 # =========================
 # Header
 # =========================
 st.markdown(
-    """
-    <div class="hero">
-      <h1>🔮 Regret Forecast Engine</h1>
-      <p>Predict your regret risk <b>before</b> you decide — with clear insights + what-if simulation.</p>
-    </div>
-    """,
-    unsafe_allow_html=True
-)
-st.caption("Built by Moin Farid · Data Science & Machine Learning")
-
-# =========================
-# Load & train
-# =========================
-try:
-    df = load_data("regret_dataset_1000.csv")
-except Exception:
-    st.error("CSV file not found. Put **regret_dataset_1000.csv** in the same folder as `app.py`.")
-    st.stop()
-
-pipeline, metrics = train_pipeline(df)
-
-# =========================
-# Sidebar inputs
-# =========================
-st.sidebar.header("🧩 Your Inputs")
-
-experience_level = st.sidebar.selectbox("Experience Level", ["Beginner", "Intermediate", "Advanced", "Expert"])
-years_experience = st.sidebar.slider("Years of Experience", 0, 12, 3)
-
-age = st.sidebar.slider("Age", 18, 55, 28)
-
-decision_type = st.sidebar.selectbox(
-    "Decision Type",
-    ["career", "finance", "relationship", "health", "purchase", "education", "travel"]
-)
-
-abroad_intent = st.sidebar.selectbox("Planning Abroad?", ["Yes", "No"])
-
-urgency_level = st.sidebar.slider("Urgency Level", 1, 10, 5)
-important_score = st.sidebar.slider("Decision Importance", 1, 10, 6)
-complexity = st.sidebar.slider("Decision Complexity", 1, 10, 6)
-time_pressure = st.sidebar.slider("Time Pressure", 1, 10, 5)
-
-effective_info_quality = st.sidebar.slider("Information Quality", 1, 10, 6)
-confidence_level = st.sidebar.slider("Confidence Level", 1, 10, 6)
-risk_aversion = st.sidebar.slider("Risk Aversion", 1, 10, 6)
-
-numbers_of_options = st.sidebar.slider("Number of Options", 2, 15, 4)
-time_spent = st.sidebar.slider("Time Spent Thinking (minutes)", 5, 240, 60)
-uncert_level = st.sidebar.slider("Uncertainty Level", 1, 10, 5)
-
-st.sidebar.markdown("---")
-run = st.sidebar.button("🚀 Run Forecast", use_container_width=True)
-
-# =========================
-# Build input DF
-# =========================
-input_df = pd.DataFrame([{
-    "age": age,
-    "experience_level": experience_level,
-    "years_experience": years_experience,
-    "urgency_level": urgency_level,
-    "decision_type": decision_type,
-    "abroad_intent": abroad_intent,
-    "important_score": important_score,
-    "complexity": complexity,
-    "time_pressure": time_pressure,
-    "effective_info_quality": effective_info_quality,
-    "risk_aversion": risk_aversion,
-    "confidence_level": confidence_level,
-    "numbers_of_options": numbers_of_options,
-    "time_spent": time_spent,
-    "uncert_level": uncert_level
-}])
-
-# =========================
-# Main Layout
-# =========================
-colA, colB = st.columns([1.25, 1])
-
-with colA:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("📌 Your Forecast")
-
-    if run:
-        score = predict_regret(pipeline, input_df)
-        st.metric("Predicted Regret Index", f"{score:.1f} / 100")
-        st.markdown(f'<div class="{box_class(score)}"><b>Regret Risk:</b> {band(score)}</div>', unsafe_allow_html=True)
-
-        st.markdown("### 🧠 Quick Insights")
-        insights = []
-
-        if urgency_level >= 8 or time_pressure >= 8:
-            insights.append("High urgency/time pressure may push a rushed decision.")
-        if effective_info_quality <= 4:
-            insights.append("Information quality looks low — missing details often create regret later.")
-        if confidence_level <= 4:
-            insights.append("Low confidence increases post-decision doubt.")
-        if uncert_level >= 7:
-            insights.append("High uncertainty is a major regret driver.")
-        if numbers_of_options >= 10:
-            insights.append("Too many options can cause overthinking and choice regret.")
-        if time_spent >= 150:
-            insights.append("Overthinking can increase regret after the decision.")
-        if time_spent <= 25 and complexity >= 7:
-            insights.append("Too little thinking time for a complex decision can raise regret.")
-
-        if not insights:
-            insights.append("Inputs look balanced. Best improvement lever is usually info quality and uncertainty reduction.")
-
-        for s in insights[:7]:
-            st.write("•", s)
-
-        st.markdown("### 🧪 What-If Simulation (How to reduce regret)")
-        base = input_df.copy()
-
-        suggestions = []
-
-        # Reduce urgency
-        _, _, d = what_if(pipeline, base, "urgency_level", clamp(urgency_level - 3, 1, 10))
-        suggestions.append(("Lower urgency (−3)", d))
-
-        # Improve info quality
-        _, _, d = what_if(pipeline, base, "effective_info_quality", clamp(effective_info_quality + 2, 1, 10))
-        suggestions.append(("Improve info quality (+2)", d))
-
-        # Improve confidence
-        _, _, d = what_if(pipeline, base, "confidence_level", clamp(confidence_level + 2, 1, 10))
-        suggestions.append(("Increase confidence (+2)", d))
-
-        # Reduce options
-        _, _, d = what_if(pipeline, base, "numbers_of_options", clamp(numbers_of_options - 3, 2, 15))
-        suggestions.append(("Reduce options (−3)", d))
-
-        # Sort best improvements first (most negative delta)
-        suggestions = sorted(suggestions, key=lambda x: x[1])
-
-        for name, delta in suggestions[:4]:
-            arrow = "↓" if delta < 0 else "↑"
-            st.write(f"• {name}: predicted regret {arrow} {abs(delta):.1f}")
-
-        st.markdown('<div class="small">This is decision-support, not professional advice.</div>', unsafe_allow_html=True)
-
-    else:
-        st.info("Set your inputs on the left and click **Run Forecast**.")
-    st.markdown("</div>", unsafe_allow_html=True)
-
-with colB:
-    st.markdown('<div class="card">', unsafe_allow_html=True)
-    st.subheader("📊 Model Quality (Unseen Test Data)")
-    st.write("Performance measured on **unseen** 20% test data:")
-
-    st.write(f"• R²: **{metrics['r2']:.3f}**")
-    st.write(f"• MAE: **{metrics['mae']:.2f}**")
-    st.write(f"• RMSE: **{metrics['rmse']:.2f}**")
-
-    st.markdown("### 🧾 Meaning (easy)")
-    st.write("• **R²**: model kitna pattern explain karta hai (higher better).")
-    st.write("• **MAE**: average prediction mistake (points).")
-    st.write("• **RMSE**: badi mistakes ko zyada punish karta hai.")
-
-    st.markdown("### ✅ What makes this project strong")
-    st.write("• Dataset designed by behavior rules (not random numbers).")
-    st.write("• Predictions + what-if guidance (not just a score).")
-    st.write("• Explainable drivers (urgency, info, uncertainty, confidence).")
-
-    st.markdown("</div>", unsafe_allow_html=True)
-
-st.markdown('<div class="footer">Regret Forecast Engine · v1</div>', unsafe_allow_html=True)
